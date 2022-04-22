@@ -72,8 +72,11 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 
+#include "open_named_fifo.h"
+
 #define INDIPORT      7624    /* default TCP/IP port to listen */
 #define REMOTEDVR     (-1234) /* invalid PID to flag remote drivers */
+#define LOCALDVR      (-2468) /* invalid PID to flag local drivers */
 #define MAXSBUF       512
 #define MAXRBUF       49152 /* max read buffering here */
 #define MAXWSIZ       49152 /* max bytes/write */
@@ -372,7 +375,7 @@ static void shutdownClient(ClInfo *cp)
 {
     Msg *mp;
 
-    /* close connection */
+    /* close socket connection */
     shutdown(cp->s, SHUT_RDWR);
     close(cp->s);
 
@@ -685,9 +688,10 @@ static void startRemoteDvr(DvrInfo *dp)
 static void startLocalDvr(DvrInfo *dp)
 {
     Msg *mp;
-    char buf[32];
-    int rp[2], wp[2], ep[2];
-    int pid;
+    char buf[64];
+    int fdstdin;
+    int fdstdout;
+    int fdctrl;
 
 #ifdef OSX_EMBEDED_MODE
     fprintf(stderr, "STARTING \"%s\"\n", dp->name);
@@ -695,105 +699,29 @@ static void startLocalDvr(DvrInfo *dp)
 #endif
 
     /* build three pipes: r, w and error*/
-    if (pipe(rp) < 0)
+    if ((fdstdin=open_named_fifo(O_WRONLY, dp->name, ".in", NULL)) < 0)
     {
-        fprintf(stderr, "%s: read pipe: %s\n", indi_tstamp(NULL), strerror(errno));
+        fprintf(stderr, "%s: stdin pipe: %s\n", indi_tstamp(NULL), strerror(errno));
         Bye();
     }
-    if (pipe(wp) < 0)
+    if ((fdstdout=open_named_fifo(O_RDONLY, dp->name, ".out", NULL)) < 0)
     {
-        fprintf(stderr, "%s: write pipe: %s\n", indi_tstamp(NULL), strerror(errno));
+        fprintf(stderr, "%s: stdout pipe: %s\n", indi_tstamp(NULL), strerror(errno));
         Bye();
     }
-    if (pipe(ep) < 0)
+    if ((fdctrl=open_named_fifo(O_RDONLY, dp->name, ".ctrl", NULL)) < 0)
     {
         fprintf(stderr, "%s: stderr pipe: %s\n", indi_tstamp(NULL), strerror(errno));
         Bye();
     }
 
-    /* fork&exec new process */
-    pid = fork();
-    if (pid < 0)
-    {
-        fprintf(stderr, "%s: fork: %s\n", indi_tstamp(NULL), strerror(errno));
-        Bye();
-    }
-    if (pid == 0)
-    {
-        /* child: exec name */
-        int fd;
-
-        /* rig up pipes */
-        dup2(wp[0], 0); /* driver stdin reads from wp[0] */
-        dup2(rp[1], 1); /* driver stdout writes to rp[1] */
-        dup2(ep[1], 2); /* driver stderr writes to e[]1] */
-        for (fd = 3; fd < 100; fd++)
-            (void)close(fd);
-
-        if (*dp->envDev)
-            setenv("INDIDEV", dp->envDev, 1);
-        /* Only reset environment variable in case of FIFO */
-        else if (fifo.fd > 0)
-            unsetenv("INDIDEV");
-        if (*dp->envConfig)
-            setenv("INDICONFIG", dp->envConfig, 1);
-        else if (fifo.fd > 0)
-            unsetenv("INDICONFIG");
-        if (*dp->envSkel)
-            setenv("INDISKEL", dp->envSkel, 1);
-        else if (fifo.fd > 0)
-            unsetenv("INDISKEL");
-        char executable[MAXSBUF];
-        if (*dp->envPrefix)
-        {
-            setenv("INDIPREFIX", dp->envPrefix, 1);
-#if defined(OSX_EMBEDED_MODE)
-            snprintf(executable, MAXSBUF, "%s/Contents/MacOS/%s", dp->envPrefix, dp->name);
-#elif defined(__APPLE__)
-            snprintf(executable, MAXSBUF, "%s/%s", dp->envPrefix, dp->name);
-#else
-            snprintf(executable, MAXSBUF, "%s/bin/%s", dp->envPrefix, dp->name);
-#endif
-
-            fprintf(stderr, "%s\n", executable);
-
-            execlp(executable, dp->name, NULL);
-        }
-        else
-        {
-            if (fifo.fd > 0)
-                unsetenv("INDIPREFIX");
-            if (dp->name[0] == '.')
-            {
-                snprintf(executable, MAXSBUF, "%s/%s", dirname(me), dp->name);
-                execlp(executable, dp->name, NULL);
-            }
-            else
-            {
-                execlp(dp->name, dp->name, NULL);
-            }
-        }
-
-#ifdef OSX_EMBEDED_MODE
-        fprintf(stderr, "FAILED \"%s\"\n", dp->name);
-        fflush(stderr);
-#endif
-        fprintf(stderr, "%s: Driver %s: execlp: %s\n", indi_tstamp(NULL), dp->name, strerror(errno));
-        _exit(1); /* parent will notice EOF shortly */
-    }
-
-    /* don't need child's side of pipes */
-    close(wp[0]);
-    close(rp[1]);
-    close(ep[1]);
-
     /* record pid, io channels, init lp and snoop list */
-    dp->pid = pid;
+    dp->pid = LOCALDVR;
     strncpy(dp->host, "localhost", MAXSBUF);
     dp->port    = -1;
-    dp->rfd     = rp[0];
-    dp->wfd     = wp[1];
-    dp->efd     = ep[0];
+    dp->wfd     = fdstdin;
+    dp->rfd     = fdstdout;
+    dp->efd     = fdctrl;
     dp->lp      = newLilXML();
     dp->msgq    = newFQ(1);
     dp->sprops  = (Property *)malloc(1); /* seed for realloc */
@@ -852,17 +780,16 @@ static void shutdownDvr(DvrInfo *dp, int restart)
         delXMLEle(root);
     }
 
-    /* make sure it's dead, reclaim resources */
+    /* reclaim resources (connections) */
     if (dp->pid == REMOTEDVR)
     {
-        /* socket connection */
+        /* close socket connection */
         shutdown(dp->wfd, SHUT_RDWR);
         close(dp->wfd); /* same as rfd */
     }
     else
     {
-        /* local pipe connection */
-        kill(dp->pid, SIGKILL); /* we've insured there are no zombies */
+        /* close local named FIFOs */
         close(dp->wfd);
         close(dp->rfd);
         close(dp->efd);
@@ -931,9 +858,9 @@ static int sendDriverMsg(DvrInfo *dp)
     if (nw <= 0)
     {
         if (nw == 0)
-            fprintf(stderr, "%s: Driver %s: write returned 0\n", indi_tstamp(NULL), dp->name);
+            fprintf(stderr, "%s: Driver %s[wfd=%d]: write returned 0\n", indi_tstamp(NULL), dp->name, dp->wfd);
         else
-            fprintf(stderr, "%s: Driver %s: write: %s\n", indi_tstamp(NULL), dp->name, strerror(errno));
+            fprintf(stderr, "%s: Driver %s[wfd=%d]: write: %s\n", indi_tstamp(NULL), dp->name, dp->wfd, strerror(errno));
         shutdownDvr(dp, 1);
         return (-1);
     }
